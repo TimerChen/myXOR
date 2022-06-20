@@ -9,6 +9,7 @@ package myxor
 
 import (
 	"errors"
+	"io"
 	"sync"
 )
 
@@ -85,6 +86,10 @@ type Encoder interface {
 	// The data will not be copied, except for the last shard, so you
 	// should not modify the data of the input slice afterwards.
 	Split(data []byte) ([][]byte, error)
+
+	Verify(shards [][]byte) (bool, error)
+
+	Join(dst io.Writer, shards [][]byte, outSize int) error
 }
 
 const (
@@ -145,7 +150,7 @@ func New(dataShards, parityShards int, opts ...Option) (Encoder, error) {
 		return &r, nil
 	}
 
-	var err error
+	var err error = nil
 	// switch {
 	// case r.o.fastOneParity && parityShards == 1:
 	// 	r.m, err = buildXorMatrix(dataShards, r.Shards)
@@ -153,7 +158,7 @@ func New(dataShards, parityShards int, opts ...Option) (Encoder, error) {
 	// 	r.m, err = buildMatrixCauchy(dataShards, r.Shards)
 	// case r.o.usePAR1Matrix:
 	// 	r.m, err = buildMatrixPAR1(dataShards, r.Shards)
-	// default:
+	// default:xo
 	// 	r.m, err = buildMatrix(dataShards, r.Shards)
 	// }
 	if err != nil {
@@ -168,6 +173,10 @@ func New(dataShards, parityShards int, opts ...Option) (Encoder, error) {
 }
 
 func xorEncode(src [][]byte, dst []byte, n int) {
+	// if len(dst) == nil {
+	// 	return
+	// }
+
 	for i := 0; i < n; i++ {
 		s := src[0][i]
 		for j := 1; j < len(src); j++ {
@@ -197,11 +206,14 @@ func (r *myXor) Encode(shards [][]byte) error {
 		return err
 	}
 
-	// Get the slice of output buffers.
-	output := shards[r.DataShards:]
+	if r.ParityShards == 0 {
+		return nil
+	}
 
+	// Get the slice of output buffers.
+	output := shards[r.DataShards]
 	// Do the coding.
-	xorEncode(shards[0:r.DataShards], output[r.DataShards], len(shards[0]))
+	xorEncode(shards[0:r.DataShards], output, len(shards[0]))
 	return nil
 }
 
@@ -259,7 +271,158 @@ func (r *myXor) reconstruct(shards [][]byte, dataOnly bool) error {
 		}
 	}
 
-	xorEncode(subShards, shards[invalidIndices[0]], shardSize)
+	if len(invalidIndices) == 0 && dataOnly {
+		return nil
+	}
+
+	if len(invalidIndices) > 0 {
+		shards[invalidIndices[0]] = make([]byte, shardSize)
+		xorEncode(subShards, shards[invalidIndices[0]], shardSize)
+	} else {
+		if dataOnly {
+			return nil
+		}
+		shards[r.DataShards] = make([]byte, shardSize)
+		xorEncode(subShards, shards[r.DataShards], shardSize)
+	}
 
 	return nil
 }
+
+// Verify returns true if the parity shards contain the right data.
+// The data is the same format as Encode. No data is modified.
+func (r *myXor) Verify(shards [][]byte) (bool, error) {
+	if len(shards) != r.Shards {
+		return false, ErrTooFewShards
+	}
+	err := checkShards(shards, false)
+	if err != nil {
+		return false, err
+	}
+
+	if r.ParityShards == 0 {
+		return true, nil
+	}
+
+	// Slice of buffers being checked.
+	toCheck := shards[r.DataShards]
+
+	// Do the checking.
+	n := len(shards[0])
+
+	for i := 0; i < n; i++ {
+		s := shards[0][i]
+		for j := 1; j < r.DataShards; j++ {
+			s ^= shards[j][i]
+		}
+		if s != toCheck[i] {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+var ErrReconstructRequired = errors.New("reconstruction required as one or more required data shards are nil")
+
+// Join the shards and write the data segment to dst.
+//
+// Only the data shards are considered.
+// You must supply the exact output size you want.
+//
+// If there are to few shards given, ErrTooFewShards will be returned.
+// If the total data size is less than outSize, ErrShortData will be returned.
+// If one or more required data shards are nil, ErrReconstructRequired will be returned.
+func (r *myXor) Join(dst io.Writer, shards [][]byte, outSize int) error {
+	// Do we have enough shards?
+	if len(shards) < r.DataShards {
+		return ErrTooFewShards
+	}
+	shards = shards[:r.DataShards]
+
+	// Do we have enough data?
+	size := 0
+	for _, shard := range shards {
+		if shard == nil {
+			return ErrReconstructRequired
+		}
+		size += len(shard)
+
+		// Do we have enough data already?
+		if size >= outSize {
+			break
+		}
+	}
+	if size < outSize {
+		return ErrShortData
+	}
+
+	// Copy data to dst
+	write := outSize
+	for _, shard := range shards {
+		if write < len(shard) {
+			_, err := dst.Write(shard[:write])
+			return err
+		}
+		n, err := dst.Write(shard)
+		if err != nil {
+			return err
+		}
+		write -= n
+	}
+	return nil
+}
+
+// func encode(dst []byte, src [][]byte) {
+// 	if supportsUnaligned {
+// 		fastEncode(dst, src, len(dst))
+// 	} else {
+// 		// TODO(hanwen): if (dst, a, b) have common alignment
+// 		// we could still try fastEncode. It is not clear
+// 		// how often this happens, and it's only worth it if
+// 		// the block encryption itself is hardware
+// 		// accelerated.
+// 		safeEncode(dst, src, len(dst))
+// 	}
+
+// }
+
+// // fastEncode xor in bulk. It only works on architectures that
+// // support unaligned read/writes.
+// func fastEncode(dst []byte, src [][]byte, n int) {
+// 	w := n / wordSize
+// 	if w > 0 {
+// 		wordBytes := w * wordSize
+
+// 		wordAlignSrc := make([][]byte, len(src))
+// 		for i := range src {
+// 			wordAlignSrc[i] = src[i][:wordBytes]
+// 		}
+// 		fastEnc(dst[:wordBytes], wordAlignSrc)
+// 	}
+
+// 	for i := n - n%wordSize; i < n; i++ {
+// 		s := src[0][i]
+// 		for j := 1; j < len(src); j++ {
+// 			s ^= src[j][i]
+// 		}
+// 		dst[i] = s
+// 	}
+// }
+
+// func fastEnc(dst []byte, src [][]byte) {
+// 	dw := *(*[]uintptr)(unsafe.Pointer(&dst))
+// 	sw := make([][]uintptr, len(src))
+// 	for i := range src {
+// 		sw[i] = *(*[]uintptr)(unsafe.Pointer(&src[i]))
+// 	}
+
+// 	n := len(dst) / wordSize
+// 	for i := 0; i < n; i++ {
+// 		s := sw[0][i]
+// 		for j := 1; j < len(sw); j++ {
+// 			s ^= sw[j][i]
+// 		}
+// 		dw[i] = s
+// 	}
+// }

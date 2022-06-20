@@ -1,3 +1,3 @@
-module github.com/TimerChen/myXOR
+module mypackage/myxor
 
 go 1.17

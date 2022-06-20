@@ -48,7 +48,7 @@ func shardSize(shards [][]byte) int {
 
 var ErrShortData = errors.New("not enough data to fill the number of requested shards")
 
-func (r *myxor) Split(data []byte) ([][]byte, error) {
+func (r *myXor) Split(data []byte) ([][]byte, error) {
 	if len(data) == 0 {
 		return nil, ErrShortData
 	}
@@ -88,4 +88,10 @@ func (r *myxor) Split(data []byte) ([][]byte, error) {
 	}
 
 	return dst, nil
+}
+
+func WithAutoGoroutines(shardSize int) Option {
+	return func(o *options) {
+		o.shardSize = shardSize
+	}
 }
